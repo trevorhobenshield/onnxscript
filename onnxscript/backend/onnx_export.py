@@ -313,8 +313,6 @@ class Exporter:
                         f'{sindent}{varname} = opset{opset_version}.Constant(value=make_tensor('
                         f'"value", {dtype}, '
                         f'dims={init.dims}, '
-                        ## onnx.helper.tensor_dtype_to_np_dtype(dtype) ?
-                        # f'vals=numpy.load("{path}").astype({t2np[dtype]}).flatten().tolist())'
                         f'vals=numpy.load("{path}"))'
                         f')')
                 else:
@@ -326,6 +324,10 @@ class Exporter:
             pynode = self._python_make_node(node, opsets, indent=indent)
             if pynode:
                 code.append(pynode)
+
+            if 'Relu' in pynode.split('=')[0]:
+                code.append('\n')
+
         if output_names is not None:
             for fr, to in zip(graph.output, output_names):
                 code.append(
