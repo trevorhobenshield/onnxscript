@@ -311,7 +311,7 @@ class Exporter:
                     node.attribute.append(attr)
 
                     ## onnx Tensor -> numpy array -> save to disk
-                    path = (out / init.name).with_suffix(".npy")
+                    path = f'{out / init.name}.npy'
                     numpy.save(path, onnx.numpy_helper.to_array(attr.t))
 
                     opset_version = list(opsets.values())[0]
@@ -320,7 +320,8 @@ class Exporter:
                         f'{sindent}{varname} = opset{opset_version}.Constant(value=make_tensor('
                         f'"value", {dtype}, '
                         f'dims={init.dims}, '
-                        f'vals=numpy.load("{path}").astype({t2np[dtype]}).tolist())'
+                        # f'vals=numpy.load("{path}").astype({t2np[dtype]}).flatten().tolist())'
+                        f'vals=numpy.load("{path}"))'
                         f')')
                 else:
                     code.append(self._python_make_node(node, opsets, indent=indent))
@@ -707,7 +708,6 @@ def export2python(
         function_name: main function name
         use_operators: use Python operators.
         inline_const: replace ONNX constants inline if compact
-        external_initializers: save initializers as external files
 
     Returns:
         python code
