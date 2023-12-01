@@ -13,6 +13,7 @@ from onnx.helper import make_node
 
 import onnxscript.onnx_types
 import onnxscript.type_annotation
+import pathlib
 
 kwlist = {
     "False",
@@ -218,7 +219,7 @@ class Exporter:
     """Class used for recursive traversal of Proto structures."""
 
     def __init__(
-        self, rename: bool, use_operators: bool = False, inline_const: bool = False
+            self, rename: bool, use_operators: bool = False, inline_const: bool = False
     ) -> None:
         self.use_operators = use_operators
         if rename:
@@ -258,9 +259,9 @@ class Exporter:
         return str(self._rename_variable(name))
 
     def _rename_domain(self, domain: str) -> str:
-        if domain in {"", "ai.onnx"}:
-            return "opset"  #  TODO: Need checks to avoid name conflicts.
-        return _cleanup_variable_name(domain)  # type: ignore[return-value]
+        if domain == "":
+            return "opset"
+        return domain.replace(".", "_")
 
     def _make_opset_name(self, domain, version):
         return f"{self._rename_domain(domain)}{version}"
@@ -281,11 +282,22 @@ class Exporter:
             return f"{opset}.{name}"
         return name
 
-    def _python_make_node_graph(self, graph, opsets, indent=0, output_names=None):
+    def _python_make_node_graph(self, graph, opsets, indent=0, output_names=None, external_initializers=False):
         """Translates a GraphProto into python."""
+        # map onnx Tensor dtype -> NumPy dtype
+        t2np = {
+            1: 'numpy.float32',  # FLOAT
+            2: 'numpy.int32',  # INT
+            6: 'numpy.float32',  # FLOATS
+            7: 'numpy.int32',  # INTS
+        }
         code = []
         sindent = "    " * indent
         if hasattr(graph, "initializer"):
+            if external_initializers:
+                out = pathlib.Path("initializer")
+                out.mkdir(parents=True, exist_ok=True)
+
             for init in graph.initializer:
                 node = make_node(
                     "Constant",
@@ -293,7 +305,26 @@ class Exporter:
                     [self._rename_variable(init.name)],  # type: ignore[list-item]
                     value=init,
                 )
-                code.append(self._python_make_node(node, opsets, indent=indent))
+                if external_initializers:
+                    varname = self._rename_variable(init.name)
+                    attr = onnx.helper.make_attribute('value', init)
+                    node.attribute.append(attr)
+
+                    ## onnx Tensor -> numpy array -> save to disk
+                    path = (out / init.name).with_suffix(".npy")
+                    numpy.save(path, onnx.numpy_helper.to_array(attr.t))
+
+                    opset_version = list(opsets.values())[0]
+                    dtype = attr.t.data_type
+                    code.append(
+                        f'{sindent}{varname} = opset{opset_version}.Constant(value=make_tensor('
+                        f'"value", {dtype}, '
+                        f'dims={init.dims}, '
+                        f'vals=numpy.load("{path}").astype({t2np[dtype]}).tolist())'
+                        f')')
+                else:
+                    code.append(self._python_make_node(node, opsets, indent=indent))
+
         if hasattr(graph, "sparse_initializer") and len(graph.sparse_initializer) > 0:
             raise NotImplementedError("Unable to convert sparse_initilizer into python.")
         for node in graph.node:
@@ -487,14 +518,14 @@ class Exporter:
             return f"{varname} = Opset('{domain}', {version})\n"
 
     def _translate_opset_imports(
-        self, opset_imports: Sequence[onnx.OperatorSetIdProto]
+            self, opset_imports: Sequence[onnx.OperatorSetIdProto]
     ) -> str:
         return "".join(
             [self._translate_opset_import(x.domain, x.version) for x in opset_imports]
         )
 
     def _translate_opset_imports_of(
-        self, proto: ModelProto | FunctionProto | GraphProto
+            self, proto: ModelProto | FunctionProto | GraphProto
     ) -> str:
         if hasattr(proto, "opset_import"):
             text = self._translate_opset_imports(proto.opset_import)
@@ -552,13 +583,11 @@ class Exporter:
         add_line(f"    return {return_values}")
         return "\n".join(result)
 
-    def _translate_graph(self, model: onnx.ModelProto, function_name: Optional[str]) -> str:
+    def _translate_graph(self, model: onnx.ModelProto, function_name: str, external_initializers: bool) -> str:
         graph = model.graph
         opsets = {}
         for imported in model.opset_import:
             opsets[imported.domain] = imported.version
-        if function_name is None:
-            function_name = _cleanup_variable_name(graph.name)
 
         result: list[str] = []
 
@@ -570,13 +599,13 @@ class Exporter:
         doc = graph.doc_string
         if doc:
             add(f'    """{doc}"""')
-        add(self._python_make_node_graph(graph, opsets, indent=1))
+        add(self._python_make_node_graph(graph, opsets, indent=1, external_initializers=external_initializers))
         return_values = ", ".join(self._rename_variable(x) for x in graph.output)
         add(f"    return {return_values}")
         return "\n".join(result)
 
     def _import_onnx_types(
-        self, proto: onnx.ModelProto | onnx.GraphProto | onnx.FunctionProto
+            self, proto: onnx.ModelProto | onnx.GraphProto | onnx.FunctionProto
     ) -> str:
         """Generate import statements for types used in the graph."""
         if isinstance(proto, ModelProto):
@@ -595,9 +624,7 @@ class Exporter:
             return "from onnxscript.onnx_types import " + ", ".join(sorted_types)
         return ""
 
-    def export(
-        self, proto: onnx.ModelProto | onnx.FunctionProto, function_name: Optional[str]
-    ) -> str:
+    def export(self, proto: onnx.ModelProto | onnx.FunctionProto, function_name: str, external_initializers: bool) -> str:
         result: list[str] = []
 
         def add(line: str) -> None:
@@ -613,9 +640,10 @@ class Exporter:
 
         if isinstance(proto, ModelProto):
             translated_functions = [self._translate_function(f) for f in proto.functions]
-            translated_functions.append(self._translate_graph(proto, function_name))
+            translated_functions.append(self._translate_graph(proto, function_name, external_initializers))
         else:
             assert isinstance(proto, FunctionProto)
+            # TODO: use function_name?
             translated_functions = [self._translate_function(proto)]
 
         # TODO: unique_function_domain_version.add((f.domain, 1))
@@ -632,7 +660,7 @@ class Exporter:
 
 
 def _attribute_param_types(
-    funproto: onnx.FunctionProto,
+        funproto: onnx.FunctionProto,
 ) -> dict[str, onnx.AttributeProto.AttributeType]:
     """Compute mapping from (names of) attribute parameters of function to their types."""
     type_map = {}
@@ -657,20 +685,29 @@ def _attribute_param_types(
 
 
 def export2python(
-    model_onnx,
-    function_name: Optional[str] = None,
-    rename: bool = False,
-    use_operators: bool = False,
-    inline_const: bool = False,
+        model_onnx,
+        opset=None,
+        verbose=True,
+        name=None,
+        rename=False,
+        function_name="main",
+        use_operators=False,
+        inline_const: bool = False,
+        external_initializers: bool = False,
 ):
     """Exports an ONNX model to the *python* syntax.
 
     Args:
         model_onnx: string or ONNX graph
+        opset: opset to export to (None to select the one from the
+            graph)
+        verbose: inserts prints
+        name: to overwrite onnx name
         rename: rename the names to get shorter names
         function_name: main function name
         use_operators: use Python operators.
         inline_const: replace ONNX constants inline if compact
+        external_initializers: save initializers as external files
 
     Returns:
         python code
@@ -690,6 +727,9 @@ def export2python(
         code = export2python(onx)
         print(code)
     """
+    del opset  # unused
+    del verbose  # unused
+    del name  # unused
     if isinstance(model_onnx, str):
         model_onnx = onnx.load(model_onnx)
 
@@ -697,4 +737,4 @@ def export2python(
         raise TypeError(f"The function expects a ModelProto not {type(model_onnx)!r}.")
 
     exporter = Exporter(rename, use_operators, inline_const)
-    return exporter.export(model_onnx, function_name)
+    return exporter.export(model_onnx, function_name, external_initializers)
