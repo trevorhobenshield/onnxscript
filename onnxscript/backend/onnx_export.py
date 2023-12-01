@@ -284,13 +284,6 @@ class Exporter:
 
     def _python_make_node_graph(self, graph, opsets, indent=0, output_names=None, external_initializers=False):
         """Translates a GraphProto into python."""
-        # map onnx Tensor dtype -> NumPy dtype
-        t2np = {
-            1: 'numpy.float32',  # FLOAT
-            2: 'numpy.int32',  # INT
-            6: 'numpy.float32',  # FLOATS
-            7: 'numpy.int32',  # INTS
-        }
         code = []
         sindent = "    " * indent
         if hasattr(graph, "initializer"):
@@ -320,6 +313,7 @@ class Exporter:
                         f'{sindent}{varname} = opset{opset_version}.Constant(value=make_tensor('
                         f'"value", {dtype}, '
                         f'dims={init.dims}, '
+                        ## onnx.helper.tensor_dtype_to_np_dtype(dtype) ?
                         # f'vals=numpy.load("{path}").astype({t2np[dtype]}).flatten().tolist())'
                         f'vals=numpy.load("{path}"))'
                         f')')
